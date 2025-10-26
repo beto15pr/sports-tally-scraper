@@ -1,1 +1,12 @@
+requests
+readability-lxml
+beautifulsoup4
+pandas
+python-dotenv
+lxml
+tqdm
+python-dateutil
+fastapi
+uvicorn
+pydantic
 

@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Prediction Tally Scraper
-------------------------
+Prediction Tally Scraper (batch-friendly)
+-----------------------------------------
 Given a query like "Texans vs 49ers prediction", fetch the first N Google results (via Serper.dev or SerpAPI),
 filter to pages published in the last --days (default 5), try to *extract who wins*, and tally votes.
 Outputs a CSV of sources and a quick console/Markdown summary.
 
-Usage:
+Now includes:
+- stricter winner extraction (final-score preference, token verification, spread guard)
+- bet_type detection: "spread" or "moneyline" (or "unknown" when unclear)
+
+CLI (single):
   export SERPER_API_KEY=...
   python tally_predictions.py \
     --provider serper \
@@ -17,11 +21,6 @@ Usage:
     --results 50 --days 5 \
     --allow "espn.com,actionnetwork.com,covers.com,pickswise.com,rotowire.com,usatoday.com,sportingnews.com,cbssports.com,oddsshark.com" \
     --out predictions_texans_49ers.csv --md predictions_texans_49ers.md
-
-Notes:
-- Only articles with a detectable publish date within the last N days are counted.
-- If the script cannot detect a winner with high confidence, it marks the row as 'ambiguous' and excludes from the tally by default.
-- Respect site Terms, robots.txt, and rate limits.
 """
 import os, re, json, argparse, sys, time
 from datetime import datetime, timezone, timedelta
@@ -62,52 +61,31 @@ def env_key(provider, cli_key):
     return None
 
 def map_recency_to_tbs(days):
-    # We can't express '5 days' exactly; use qdr:w (last 7 days) to bias results,
-    # then strictly filter by publish date later.
-    if days <= 1:
-        return "qdr:d"
-    if days <= 7:
-        return "qdr:w"
-    if days <= 31:
-        return "qdr:m"
+    if days <= 1: return "qdr:d"
+    if days <= 7: return "qdr:w"
+    if days <= 31: return "qdr:m"
     return None
 
 def search_serper(api_key, query, num=10, tbs=None):
     url = "https://google.serper.dev/search"
     headers = {"X-API-KEY": api_key, "Content-Type":"application/json"}
     payload = {"q": query, "num": num}
-    if tbs:
-        payload["tbs"] = tbs
+    if tbs: payload["tbs"] = tbs
     r = requests.post(url, headers=headers, json=payload, timeout=30)
     r.raise_for_status()
     data = r.json()
     items = data.get("organic", []) or []
-    results = []
-    for it in items:
-        results.append({
-            "title": it.get("title"),
-            "link": it.get("link"),
-            "snippet": it.get("snippet"),
-        })
-    return results
+    return [{"title": it.get("title"), "link": it.get("link"), "snippet": it.get("snippet")} for it in items]
 
 def search_serpapi(api_key, query, num=10, tbs=None):
     url = "https://serpapi.com/search.json"
     params = {"engine":"google","q":query,"num":num,"api_key":api_key}
-    if tbs:
-        params["tbs"] = tbs
+    if tbs: params["tbs"] = tbs
     r = requests.get(url, params=params, timeout=30, headers={"User-Agent": UA})
     r.raise_for_status()
     data = r.json()
     items = data.get("organic_results", []) or []
-    results = []
-    for it in items:
-        results.append({
-            "title": it.get("title"),
-            "link": it.get("link"),
-            "snippet": it.get("snippet"),
-        })
-    return results
+    return [{"title": it.get("title"), "link": it.get("link"), "snippet": it.get("snippet")} for it in items]
 
 def fetch_page(url):
     r = requests.get(url, timeout=30, headers={"User-Agent": UA})
@@ -122,17 +100,13 @@ def fetch_page(url):
 
 def extract_date_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
-    # <time datetime="...">
     t = soup.find("time", attrs={"datetime": True})
     if t and t.get("datetime"):
         dt = normalize_date(t.get("datetime"))
         if dt: return dt
-    # JSON-LD
     for s in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(s.string or "")
-        except Exception:
-            continue
+        try: data = json.loads(s.string or "")
+        except Exception: continue
         for obj in (data if isinstance(data, list) else [data]):
             if isinstance(obj, dict):
                 for k in ("datePublished","dateModified","uploadDate"):
@@ -140,7 +114,6 @@ def extract_date_from_html(html):
                     if isinstance(val, str):
                         dt = normalize_date(val)
                         if dt: return dt
-    # Meta
     for name in ("article:published_time","og:published_time","pubdate","publishdate","parsely-pub-date"):
         m = soup.find("meta", attrs={"property":name}) or soup.find("meta", attrs={"name":name})
         if m and m.get("content"):
@@ -157,7 +130,7 @@ def normalize_date(s):
     except Exception:
         return None
 
-# --- UPDATED: stricter patterns and verification ---
+# ---------- Winner extraction (with bet_type) ----------
 def make_team_patterns(team_syns):
     """
     Build regexes + a lowercase synonym set.
@@ -182,19 +155,24 @@ def make_team_patterns(team_syns):
     scoreline = rf"{name_group}\s*(\d{{1,2}})\s*[,–-]\s*([A-Za-z\s\.']+?)\s*(\d{{1,2}})"
     return [re.compile(c, re.IGNORECASE) for c in contexts], re.compile(scoreline, re.IGNORECASE), syn_set
 
+def _looks_like_spread(s: str) -> bool:
+    return bool(re.search(r"\b(?:spread|cover|ATS)\b", s, flags=re.IGNORECASE)) or bool(re.search(r"\b[+-]\d+(\.\d+)?\b", s))
+
+def _bet_type_from_text(s: str) -> str:
+    # best-effort: detect if the matched phrase clearly refers to spread
+    if _looks_like_spread(s) or re.search(r"\b(?:-|\+)\d+(\.\d+)?", s):
+        return "spread"
+    if re.search(r"\bmoneyline\b|\bstraight\s*up\b|\bto\s*win\b", s, flags=re.IGNORECASE):
+        return "moneyline"
+    return "unknown"
+
 def choose_winner(text, team_a_syns, team_b_syns):
     """
     Extract the predicted winner with false-positive guards.
-    Returns: ("A"/"B"/"ambiguous", reason, matched_phrase)
+    Returns: ("A"/"B"/"ambiguous", reason, matched_phrase, bet_type)
     """
-    # Prepare patterns + synonym sets
     ctx_a, score_a, set_a = make_team_patterns(team_a_syns)
     ctx_b, score_b, set_b = make_team_patterns(team_b_syns)
-
-    def looks_like_spread(s: str) -> bool:
-        # Avoid interpreting ATS/spread lines as straight-up winner calls
-        return bool(re.search(r"\b(?:spread|cover|ATS)\b", s, flags=re.IGNORECASE)) or \
-               bool(re.search(r"\b[+-]\d+(\.\d+)?\b", s))  # e.g., -2.5, +3
 
     # 0) Strong "final score" override
     mfs_a = re.search(
@@ -203,7 +181,8 @@ def choose_winner(text, team_a_syns, team_b_syns):
     if mfs_a:
         s1, s2 = int(mfs_a.group(2)), int(mfs_a.group(4))
         if s1 != s2:
-            return ("A" if s1 > s2 else "B"), "final_score", mfs_a.group(0)
+            phrase = mfs_a.group(0)
+            return ("A" if s1 > s2 else "B"), "final_score", phrase, "moneyline"
 
     mfs_b = re.search(
         rf"final\s*score[:\s]*({ '|'.join(re.escape(x) for x in set_b) })\s*(\d{{1,2}})\s*[,–-]\s*([A-Za-z\s\.']+?)\s*(\d{{1,2}})",
@@ -211,22 +190,25 @@ def choose_winner(text, team_a_syns, team_b_syns):
     if mfs_b:
         s1, s2 = int(mfs_b.group(2)), int(mfs_b.group(4))
         if s1 != s2:
-            return ("B" if s1 > s2 else "A"), "final_score", mfs_b.group(0)
+            phrase = mfs_b.group(0)
+            return ("B" if s1 > s2 else "A"), "final_score", phrase, "moneyline"
 
     # 1) Explicit contexts (skip spread-like phrases; verify token belongs to team set)
     for pat in ctx_a:
         ma = pat.search(text)
-        if ma and not looks_like_spread(ma.group(0)):
+        if ma and not _looks_like_spread(ma.group(0)):
             token = ma.group(1).strip().lower() if ma.groups() else ""
             if not set_a or token in set_a or token == "":
-                return "A", "explicit", ma.group(0)
+                phrase = ma.group(0)
+                return "A", "explicit", phrase, _bet_type_from_text(phrase)
 
     for pat in ctx_b:
         mb = pat.search(text)
-        if mb and not looks_like_spread(mb.group(0)):
+        if mb and not _looks_like_spread(mb.group(0)):
             token = mb.group(1).strip().lower() if mb.groups() else ""
             if not set_b or token in set_b or token == "":
-                return "B", "explicit", mb.group(0)
+                phrase = mb.group(0)
+                return "B", "explicit", phrase, _bet_type_from_text(phrase)
 
     # 2) Scoreline logic with team-token verification
     ma = score_a.search(text)
@@ -236,7 +218,8 @@ def choose_winner(text, team_a_syns, team_b_syns):
             if not set_a or token in set_a:
                 s1 = int(ma.group(2)); s2 = int(ma.group(4))
                 if s1 != s2:
-                    return ("A" if s1 > s2 else "B"), "scoreline", ma.group(0)
+                    phrase = ma.group(0)
+                    return ("A" if s1 > s2 else "B"), "scoreline", phrase, "moneyline"
         except Exception:
             pass
 
@@ -247,7 +230,8 @@ def choose_winner(text, team_a_syns, team_b_syns):
             if not set_b or token in set_b:
                 s1 = int(mb.group(2)); s2 = int(mb.group(4))
                 if s1 != s2:
-                    return ("B" if s1 > s2 else "A"), "scoreline", mb.group(0)
+                    phrase = mb.group(0)
+                    return ("B" if s1 > s2 else "A"), "scoreline", phrase, "moneyline"
         except Exception:
             pass
 
@@ -259,15 +243,16 @@ def choose_winner(text, team_a_syns, team_b_syns):
     ]
     for pat, tag in weak_ctx:
         m = pat.search(text)
-        if not m or looks_like_spread(m.group(0)):
+        if not m or _looks_like_spread(m.group(0)):
             continue
         blob = m.group(1).lower()
+        phrase = m.group(0)
         if any(s.lower() in blob for s in team_a_syns):
-            return "A", tag, m.group(0)
+            return "A", tag, phrase, _bet_type_from_text(phrase)
         if any(s.lower() in blob for s in team_b_syns):
-            return "B", tag, m.group(0)
+            return "B", tag, phrase, _bet_type_from_text(phrase)
 
-    return "ambiguous", "none", ""
+    return "ambiguous", "none", "", "unknown"
 
 def within_days(utc_dt, days):
     if not utc_dt:
@@ -289,12 +274,8 @@ def main():
     team_b_syns = [s.strip() for s in args.team_b.split(",") if s.strip()]
 
     tbs = map_recency_to_tbs(args.days)
-
-    # Search
-    if args.provider == "serper":
-        hits = search_serper(key, args.query, num=args.results, tbs=tbs)
-    else:
-        hits = search_serpapi(key, args.query, num=args.results, tbs=tbs)
+    search_fn = search_serper if args.provider == "serper" else search_serpapi
+    hits = search_fn(key, args.query, num=args.results, tbs=tbs)
 
     rows = []
     for h in hits:
@@ -309,15 +290,12 @@ def main():
         try:
             title, text, pub = fetch_page(url)
         except Exception:
-            # Skip troublesome pages gracefully
             continue
         pub_dt = pub if isinstance(pub, datetime) else None
         if not within_days(pub_dt, args.days):
-            # Strict: must be within last N days AND date must be detected.
             continue
 
-        # Extract winner
-        who, method, phrase = choose_winner(" ".join([title or "", h.get("snippet","") or "", text or ""]), team_a_syns, team_b_syns)
+        who, method, phrase, bet_type = choose_winner(" ".join([title or "", h.get("snippet","") or "", text or ""]), team_a_syns, team_b_syns)
 
         rows.append({
             "published_utc": pub_dt.isoformat() if pub_dt else "",
@@ -326,26 +304,24 @@ def main():
             "result_title": h.get("title",""),
             "page_title": title or "",
             "snippet": h.get("snippet","") or "",
-            "winner": who,           # "A", "B", or "ambiguous"
-            "winner_method": method, # "explicit", "scoreline", "moneyline_field", etc.
+            "winner": who,                 # "A", "B", or "ambiguous"
+            "winner_method": method,       # "explicit", "scoreline", ...
             "match_phrase": phrase,
+            "bet_type": bet_type           # "spread" | "moneyline" | "unknown"
         })
         time.sleep(args.rate)
 
     df = pd.DataFrame(rows)
     if df.empty:
         print("No eligible articles found in the last {} days (or filters too strict).".format(args.days))
-        # Still write empty CSV for consistency
         df.to_csv(args.out, index=False)
         if args.md:
             with open(args.md, "w", encoding="utf-8") as f:
                 f.write("# Prediction Tally (No eligible sources)\n")
         sys.exit(0)
 
-    # Save all rows
     df.to_csv(args.out, index=False)
 
-    # Build tally excluding ambiguous
     a_votes = int((df["winner"] == "A").sum())
     b_votes = int((df["winner"] == "B").sum())
     ambig   = int((df["winner"] == "ambiguous").sum())
@@ -366,7 +342,7 @@ def main():
             f.write(f"- Ambiguous/Unclear (excluded): {ambig}\n\n")
             f.write("## Sources\n")
             for _, r in df.iterrows():
-                f.write(f"- {r['published_utc']} — **{r['page_title'] or r['result_title']}** ({r['domain']}) — winner: {r['winner']} via {r['winner_method']}\n  \n  <{r['url']}>\n\n")
+                f.write(f"- {r['published_utc']} — **{r['page_title'] or r['result_title']}** ({r['domain']}) — winner: {r['winner']} via {r['winner_method']} — {r['bet_type']}\n  \n  <{r['url']}>\n\n")
         print(f"Markdown summary: {args.md}")
 
 if __name__ == "__main__":

@@ -1,1 +1,37 @@
+services:
+  # FastAPI web service
+  - type: web
+    name: sports-tally-api
+    env: python
+    plan: free
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SERPER_API_KEY
+        sync: false   # set the value in Render dashboard (Environment tab)
+
+  # Optional: daily scheduled run that writes CSVs to a persistent disk
+  - type: cron
+    name: sports-tally-daily
+    env: python
+    schedule: "0 13 * * *"  # 13:00 UTC ≈ 08:00 CT (adjust for DST)
+    buildCommand: pip install -r requirements.txt
+    startCommand: >
+      python tally_predictions.py
+      --provider serper
+      --query "Texans vs 49ers prediction"
+      --team-a "Houston Texans,Texans,Houston"
+      --team-b "San Francisco 49ers,49ers,San Francisco,SF"
+      --results 50
+      --days 5
+      --allow "espn.com,actionnetwork.com,covers.com,pickswise.com,rotowire.com,usatoday.com,sportingnews.com,cbssports.com,oddsshark.com"
+      --out /data/predictions_texans_49ers.csv
+    envVars:
+      - key: SERPER_API_KEY
+        sync: false
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
 

@@ -157,14 +157,20 @@ def normalize_date(s):
     except Exception:
         return None
 
+# --- UPDATED: stricter patterns and verification ---
 def make_team_patterns(team_syns):
-    # Build regex to match specific "winner" contexts
-    syns = [re.escape(x.strip()) for x in team_syns if x.strip()]
-    # Most precise tokens first (longer first)
+    """
+    Build regexes + a lowercase synonym set.
+    Returns (context_patterns, scoreline_pattern, synonym_set)
+    """
+    syn_set = {s.strip().lower() for s in team_syns if s.strip()}
+    syns = [re.escape(x) for x in syn_set]
     syns = sorted(set(syns), key=len, reverse=True)
-    name_group = "(" + "|".join(syns) + ")"
-    # Winner contexts to prefer (moneyline / win / straight up / prediction / pick)
+    name_group = "(" + "|".join(syns) + ")" if syns else "(.*)"
+
     contexts = [
+        # Prefer explicit "Final score:" statements
+        rf"(?:final\s*score[:\s]*{name_group}\s*\d{{1,2}}[,–-]\s*[A-Za-z\s\.']+\s*\d{{1,2}})",
         rf"(?:moneyline\s*pick\s*[:\-]?\s*{name_group})",
         rf"(?:pick\s*[:\-]?\s*{name_group})",
         rf"(?:prediction\s*[:\-]?\s*{name_group})",
@@ -173,50 +179,79 @@ def make_team_patterns(team_syns):
         rf"(?:winner\s*[:\-]?\s*{name_group})",
         rf"(?:straight\s*up\s*[:\-]?\s*{name_group})",
     ]
-    # Scoreline like "49ers 27, Texans 20"
     scoreline = rf"{name_group}\s*(\d{{1,2}})\s*[,–-]\s*([A-Za-z\s\.']+?)\s*(\d{{1,2}})"
-    return [re.compile(c, re.IGNORECASE) for c in contexts], re.compile(scoreline, re.IGNORECASE)
+    return [re.compile(c, re.IGNORECASE) for c in contexts], re.compile(scoreline, re.IGNORECASE), syn_set
 
 def choose_winner(text, team_a_syns, team_b_syns):
     """
-    Try to extract a *winner* from text using explicit contexts first.
+    Extract the predicted winner with false-positive guards.
     Returns: ("A"/"B"/"ambiguous", reason, matched_phrase)
     """
-    # Prepare patterns
-    ctx_a, score_a = make_team_patterns(team_a_syns)
-    ctx_b, score_b = make_team_patterns(team_b_syns)
+    # Prepare patterns + synonym sets
+    ctx_a, score_a, set_a = make_team_patterns(team_a_syns)
+    ctx_b, score_b, set_b = make_team_patterns(team_b_syns)
 
-    # 1) Explicit contexts
+    def looks_like_spread(s: str) -> bool:
+        # Avoid interpreting ATS/spread lines as straight-up winner calls
+        return bool(re.search(r"\b(?:spread|cover|ATS)\b", s, flags=re.IGNORECASE)) or \
+               bool(re.search(r"\b[+-]\d+(\.\d+)?\b", s))  # e.g., -2.5, +3
+
+    # 0) Strong "final score" override
+    mfs_a = re.search(
+        rf"final\s*score[:\s]*({ '|'.join(re.escape(x) for x in set_a) })\s*(\d{{1,2}})\s*[,–-]\s*([A-Za-z\s\.']+?)\s*(\d{{1,2}})",
+        text, re.IGNORECASE) if set_a else None
+    if mfs_a:
+        s1, s2 = int(mfs_a.group(2)), int(mfs_a.group(4))
+        if s1 != s2:
+            return ("A" if s1 > s2 else "B"), "final_score", mfs_a.group(0)
+
+    mfs_b = re.search(
+        rf"final\s*score[:\s]*({ '|'.join(re.escape(x) for x in set_b) })\s*(\d{{1,2}})\s*[,–-]\s*([A-Za-z\s\.']+?)\s*(\d{{1,2}})",
+        text, re.IGNORECASE) if set_b else None
+    if mfs_b:
+        s1, s2 = int(mfs_b.group(2)), int(mfs_b.group(4))
+        if s1 != s2:
+            return ("B" if s1 > s2 else "A"), "final_score", mfs_b.group(0)
+
+    # 1) Explicit contexts (skip spread-like phrases; verify token belongs to team set)
     for pat in ctx_a:
-        m = pat.search(text)
-        if m:
-            return "A", "explicit", m.group(0)
+        ma = pat.search(text)
+        if ma and not looks_like_spread(ma.group(0)):
+            token = ma.group(1).strip().lower() if ma.groups() else ""
+            if not set_a or token in set_a or token == "":
+                return "A", "explicit", ma.group(0)
+
     for pat in ctx_b:
-        m = pat.search(text)
-        if m:
-            return "B", "explicit", m.group(0)
+        mb = pat.search(text)
+        if mb and not looks_like_spread(mb.group(0)):
+            token = mb.group(1).strip().lower() if mb.groups() else ""
+            if not set_b or token in set_b or token == "":
+                return "B", "explicit", mb.group(0)
 
-    # 2) Scoreline logic (TeamName 27, Opp 20)
-    m = score_a.search(text)
-    if m:
+    # 2) Scoreline logic with team-token verification
+    ma = score_a.search(text)
+    if ma:
         try:
-            # m groups: winnerName, score1, otherName text, score2
-            s1 = int(m.group(2)); s2 = int(m.group(4))
-            if s1 != s2:
-                return ("A" if s1 > s2 else "B"), "scoreline", m.group(0)
+            token = ma.group(1).strip().lower()
+            if not set_a or token in set_a:
+                s1 = int(ma.group(2)); s2 = int(ma.group(4))
+                if s1 != s2:
+                    return ("A" if s1 > s2 else "B"), "scoreline", ma.group(0)
         except Exception:
             pass
 
-    m = score_b.search(text)
-    if m:
+    mb = score_b.search(text)
+    if mb:
         try:
-            s1 = int(m.group(2)); s2 = int(m.group(4))
-            if s1 != s2:
-                return ("B" if s1 > s2 else "A"), "scoreline", m.group(0)
+            token = mb.group(1).strip().lower()
+            if not set_b or token in set_b:
+                s1 = int(mb.group(2)); s2 = int(mb.group(4))
+                if s1 != s2:
+                    return ("B" if s1 > s2 else "A"), "scoreline", mb.group(0)
         except Exception:
             pass
 
-    # 3) Weak contexts (avoid ATS-only "to cover")
+    # 3) Weak fallback fields (avoid ATS)
     weak_ctx = [
         (re.compile(r"\bmoneyline[:\s]+([A-Za-z\.\s']+)", re.IGNORECASE), "moneyline_field"),
         (re.compile(r"\bpick[:\s]+([A-Za-z\.\s']+)", re.IGNORECASE), "pick_field"),
@@ -224,7 +259,7 @@ def choose_winner(text, team_a_syns, team_b_syns):
     ]
     for pat, tag in weak_ctx:
         m = pat.search(text)
-        if not m:
+        if not m or looks_like_spread(m.group(0)):
             continue
         blob = m.group(1).lower()
         if any(s.lower() in blob for s in team_a_syns):
@@ -336,4 +371,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
